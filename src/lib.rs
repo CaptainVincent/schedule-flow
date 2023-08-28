@@ -11,7 +11,7 @@ pub fn run() {
     let keyword = std::env::var("KEYWORD").unwrap();
     _ = std::env::var("slack_workspace").unwrap();
     _ = std::env::var("slack_channel").unwrap();
-
+    println!("123");
     schedule_cron_job(String::from("50 * * * *"), keyword, callback);
 }
 
