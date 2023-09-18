@@ -9,7 +9,6 @@ use flowsnet_platform_sdk::logger;
 
 #[no_mangle]
 pub fn run() {
-    dotenv().ok();
     logger::init();
     let keyword = std::env::var("KEYWORD").unwrap();
     _ = std::env::var("slack_workspace").unwrap();
