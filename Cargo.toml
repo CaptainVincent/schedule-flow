@@ -1,34 +1,19 @@
-[dependencies.http_req_wasi]
-version = "0.11"
-
-[dependencies.lazy_static]
-version = "1"
-
-[dependencies.serde]
-features = ["derive"]
-version = "1.0"
-
-[dependencies.serde_json]
-version = "1.0"
-
-[dependencies.urlencoding]
-version = "2"
-
-[dependencies.webhook-flows-macros]
-version = "0.2"
+[package]
+name = "flows-mysql-example"
+version = "0.1.0"
+edition = "2021"
 
 [lib]
-crate-type = ["lib", "cdylib"]
 path = "src/lib.rs"
+crate-type = ["cdylib"]
 
-[package]
-description = "Webhook integration for flows.network"
-documentation = "https://docs.rs/webhook-flows"
-edition = "2021"
-license = "MIT/Apache-2.0"
-name = "webhook-flows"
-readme = "README.md"
-resolver = "1"
-version = "0.4.0"
-[package.metadata.docs.rs]
-default-target = "wasm32-wasi"
+[dependencies]
+log = "*"
+serde_json = "*"
+serde = "*"
+tokio_wasi = { version = "1.25.1", features = ["macros", "rt"] }
+mysql_async_wasi = "0.31"
+
+# flows
+flowsnet-platform-sdk = "0.1"
+webhook-flows = "0.4"

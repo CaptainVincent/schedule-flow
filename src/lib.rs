@@ -1,109 +1,243 @@
-//! Make a flow function triggerable from webhooks in [Flows.network](https://flows.network)
-//!
-//! # Quick Start
-//!
-//! To get started, let's write a very tiny flow function.
-//!
-//! ```rust
-//! use webhook_flows::{create_endpoint, request_handler, send_response};
-//!
-//! #[no_mangle]
-//! #[tokio::main(flavor = "current_thread")]
-//! pub async fn on_deploy() {
-//!     create_endpoint().await;
-//! }
-//!
-//! #[request_handler]
-//! async fn handler(_headers: Vec<(String, String)>, _subpath: String, _qry: HashMap<String, Value>, _body: Vec<u8>) {
-//!     send_response(
-//!         200,
-//!         vec![(String::from("content-type"), String::from("text/html"))],
-//!         "ok".as_bytes().to_vec(),
-//!     );
-//! }
-//! ```
-//!
-//! When a new request is received the function `handler` decorated by macro [request_handler] will be called and [send_response()] is used to make the response.
+use mysql_async::{prelude::*, Opts, OptsBuilder, Pool, PoolConstraints, PoolOpts};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use std::collections::HashMap;
 
-use http_req::request;
-use lazy_static::lazy_static;
-use serde_json::Value;
+// flows
+use flowsnet_platform_sdk::logger;
+use webhook_flows::{create_endpoint, request_handler, send_response};
 
-pub use webhook_flows_macros::*;
-
-lazy_static! {
-    static ref WEBHOOK_API_PREFIX: String = String::from(
-        std::option_env!("WEBHOOK_API_PREFIX").unwrap_or("https://webhook.flows.network/api")
-    );
-}
-const WEBHOOK_ENTRY_URL: &str = "https://code.flows.network/webhook";
-
-extern "C" {
-    fn get_flows_user(p: *mut u8) -> i32;
-    fn get_flow_id(p: *mut u8) -> i32;
-    fn set_error_log(p: *const u8, len: i32);
-    fn set_output(p: *const u8, len: i32);
-    fn set_response(p: *const u8, len: i32);
-    fn set_response_headers(p: *const u8, len: i32);
-    fn set_response_status(status: i32);
-    // fn redirect_to(p: *const u8, len: i32);
+#[derive(Debug, Deserialize, Serialize)]
+struct Order {
+    order_id: i32,
+    production_id: i32,
+    quantity: i32,
+    amount: f32,
+    shipping: f32,
+    tax: f32,
+    shipping_address: String,
 }
 
-/// Register a callback closure with the query and body of the request for the webhook service.
-///
-/// The query is formed as a [HashMap]. For example, say the entrypoint of the webhook service is
-/// `https://code.flows.network/webhook/6rtSi9SEsC?param=hello`
-/// then the query will look like `HashMap("param", Value::String("hello"))`
-///
-/// The body is the raw bytes of the request body.
-pub async fn create_endpoint() {
-    unsafe {
-        let mut flows_user = Vec::<u8>::with_capacity(100);
-        let c = get_flows_user(flows_user.as_mut_ptr());
-        flows_user.set_len(c as usize);
-        let flows_user = String::from_utf8(flows_user).unwrap();
-
-        let mut flow_id = Vec::<u8>::with_capacity(100);
-        let c = get_flow_id(flow_id.as_mut_ptr());
-        if c == 0 {
-            panic!("Failed to get flow id");
+impl Order {
+    fn new(
+        order_id: i32,
+        production_id: i32,
+        quantity: i32,
+        amount: f32,
+        shipping: f32,
+        tax: f32,
+        shipping_address: String,
+    ) -> Self {
+        Self {
+            order_id,
+            production_id,
+            quantity,
+            amount,
+            shipping,
+            tax,
+            shipping_address,
         }
-        flow_id.set_len(c as usize);
-        let flow_id = String::from_utf8(flow_id).unwrap();
+    }
+}
 
-        let mut writer = Vec::new();
-        let res = request::get(
-            format!(
-                "{}/{}/{}/listen?handler_fn={}",
-                WEBHOOK_API_PREFIX.as_str(),
-                flows_user,
-                flow_id,
-                "__webhook__on_request_received"
-            ),
-            &mut writer,
-        )
+fn get_url() -> String {
+    if let Ok(url) = std::env::var("DATABASE_URL") {
+        let opts = Opts::from_url(&url).expect("DATABASE_URL invalid");
+        if opts
+            .db_name()
+            .expect("a database name is required")
+            .is_empty()
+        {
+            panic!("database name is empty");
+        }
+        url
+    } else {
+        "mysql://root:pass@127.0.0.1:3306/mysql".into()
+    }
+}
+
+#[no_mangle]
+#[tokio::main(flavor = "current_thread")]
+pub async fn on_deploy() {
+    logger::init();
+    log::info!("run()");
+    let database_url = std::env::var("DATABASE_URL").unwrap();
+    log::info!("database_url {}", database_url);
+    create_endpoint().await;
+}
+
+#[request_handler]
+async fn webhook_handler(
+    headers: Vec<(String, String)>,
+    path: String,
+    query: HashMap<String, Value>,
+    body: Vec<u8>,
+) {
+    logger::init();
+    log::info!("header: {:?}", headers);
+    log::info!("query: {:?}", query);
+    log::info!("path: {:?}", path);
+    log::info!("body: {:?}", body);
+
+    // handler queries
+    let action = query.get("action").unwrap().as_str().unwrap();
+
+    // connect to database
+    log::info!("connect to database");
+    let opts = Opts::from_url(&*get_url()).unwrap();
+    let builder = OptsBuilder::from_opts(opts);
+    let constraints = PoolConstraints::new(5, 10).unwrap();
+    let pool_opts = PoolOpts::default().with_constraints(constraints);
+    let pool = Pool::new(builder.pool_opts(pool_opts));
+    let mut conn = pool.get_conn().await.unwrap();
+
+    // create table if no tables exist
+    log::info!("check and create table if no tables exist");
+    let result = r"SHOW TABLES LIKE 'orders';"
+        .with(())
+        .map(&mut conn, |s: String| String::from(s))
+        .await
         .unwrap();
+    if result.len() == 0 {
+        // table doesn't exist, create a new one
+        log::info!("table doesn't exist, create a new one");
+        r"CREATE TABLE orders (order_id INT, production_id INT, quantity INT, amount FLOAT,
+          shipping FLOAT, tax FLOAT, shipping_address VARCHAR(20));"
+            .ignore(&mut conn)
+            .await
+            .unwrap();
+    }
 
-        match res.status_code().is_success() {
-            true => {
-                let listener: Value = serde_json::from_slice(&writer).unwrap();
-                let l_key = listener["l_key"].as_str().unwrap();
-                let output = format!("Webhook endpoint: {}/{}", WEBHOOK_ENTRY_URL, l_key);
-                set_output(output.as_ptr(), output.len() as i32);
-            }
-            false => {
-                set_error_log(writer.as_ptr(), writer.len() as i32);
-            }
+    // handle action
+    let response = match action {
+        "init" => {
+            // init order data
+            r"DELETE FROM orders;".ignore(&mut conn).await.unwrap();
+            let orders = vec![
+                Order::new(1, 12, 2, 56.0, 15.0, 2.0, String::from("Mataderos 2312")),
+                Order::new(2, 15, 3, 256.0, 30.0, 16.0, String::from("1234 NW Bobcat")),
+                Order::new(3, 11, 5, 536.0, 50.0, 24.0, String::from("20 Havelock")),
+                Order::new(4, 8, 8, 126.0, 20.0, 12.0, String::from("224 Pandan Loop")),
+                Order::new(5, 24, 1, 46.0, 10.0, 2.0, String::from("No.10 Jalan Besar")),
+            ];
+            r"INSERT INTO orders (order_id, production_id, quantity, amount, shipping, tax, shipping_address)
+              VALUES (:order_id, :production_id, :quantity, :amount, :shipping, :tax, :shipping_address)"
+                .with(orders.iter().map(|order| {
+                    params! {
+                        "order_id" => order.order_id,
+                        "production_id" => order.production_id,
+                        "quantity" => order.quantity,
+                        "amount" => order.amount,
+                        "shipping" => order.shipping,
+                        "tax" => order.tax,
+                        "shipping_address" => &order.shipping_address,
+                    }
+                }))
+                .batch(&mut conn)
+                .await.unwrap();
+            json!({"status": "success"}).to_string()
         }
-    }
-}
+        "queryAll" => {
+            // query order data
+            let loaded_orders = r"SELECT * FROM orders"
+                .with(())
+                .map(
+                    &mut conn,
+                    |(
+                        order_id,
+                        production_id,
+                        quantity,
+                        amount,
+                        shipping,
+                        tax,
+                        shipping_address,
+                    )| {
+                        Order::new(
+                            order_id,
+                            production_id,
+                            quantity,
+                            amount,
+                            shipping,
+                            tax,
+                            shipping_address,
+                        )
+                    },
+                )
+                .await
+                .unwrap();
+            json!({"status": "success", "data": loaded_orders}).to_string()
+        }
+        "queryById" => {
+            let order_id = query.get("order_id").unwrap().as_str().unwrap();
+            // query order data
+            let loaded_orders = r"SELECT * FROM orders WHERE order_id = :order_id"
+                .with(params! {"order_id" => order_id})
+                .map(
+                    &mut conn,
+                    |(
+                        order_id,
+                        production_id,
+                        quantity,
+                        amount,
+                        shipping,
+                        tax,
+                        shipping_address,
+                    )| {
+                        Order::new(
+                            order_id,
+                            production_id,
+                            quantity,
+                            amount,
+                            shipping,
+                            tax,
+                            shipping_address,
+                        )
+                    },
+                )
+                .await
+                .unwrap();
+            json!({"status": "success", "data": loaded_orders}).to_string()
+        }
+        "deleteById" => {
+            // delete order by order_id
+            let order_id = query.get("order_id").unwrap().as_str().unwrap();
+            r"DELETE FROM orders WHERE order_id = :order_id"
+                .with(vec![params! {"order_id" => order_id}])
+                .batch(&mut conn)
+                .await
+                .unwrap();
+            json!({"status": "success"}).to_string()
+        }
+        "updateAddressById" => {
+            // update order address info by order_id
+            let order_id = query.get("order_id").unwrap().as_str().unwrap();
+            let shipping_address = query.get("shipping_address").unwrap().as_str().unwrap();
+            r"UPDATE orders SET shipping_address = :shipping_address WHERE order_id = :order_id"
+                .with(vec![
+                    params! {"order_id" => order_id, "shipping_address" => shipping_address},
+                ])
+                .batch(&mut conn)
+                .await
+                .unwrap();
+            json!({"status": "success"}).to_string()
+        }
+        _ => {
+            let message = format!("unknown action: {}", action);
+            log::info!("{}", message);
+            json!({"status": "fail", "message": message}).to_string()
+        }
+    };
 
-/// Set the response for the webhook service.
-pub fn send_response(status: u16, headers: Vec<(String, String)>, body: Vec<u8>) {
-    let headers = serde_json::to_string(&headers).unwrap_or_default();
-    unsafe {
-        set_response_status(status as i32);
-        set_response_headers(headers.as_ptr(), headers.len() as i32);
-        set_response(body.as_ptr(), body.len() as i32);
-    }
+    // disconnect from database
+    drop(conn);
+    pool.disconnect().await.unwrap();
+
+    send_response(
+        200,
+        vec![(
+            String::from("content-type"),
+            String::from("text/plain; charset=UTF-8"),
+        )],
+        response.as_bytes().to_vec(),
+    )
 }
